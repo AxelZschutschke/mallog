@@ -1,11 +1,18 @@
 #define _GNU_SOURCE
 
+#define WITH_STACK
+#define WITH_FILTER
+
 #include <sys/types.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <dlfcn.h>
 #include <time.h>
 #include <pthread.h>
+#include <execinfo.h>
+#include <string.h>
+
+#include "mallog.h"
 
 static void* (*real_malloc)(size_t)=NULL;
 static void* (*real_realloc)(void*, size_t)=NULL;
@@ -18,6 +25,23 @@ char buffer[8192];
 pid_t recursive = 0;
 pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t init_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+pid_t filter[100];
+size_t n_filter = 0;
+
+void add_filter() {
+    if( n_filter >= sizeof(filter) )
+        return;
+
+    pid_t tid = gettid();
+    int found = 0;
+    for( size_t i = 0; i < n_filter; ++i )
+      if( filter[i] == tid )
+        return;
+
+    filter[n_filter] = tid;
+    n_filter++;
+}
 
 static void open_mallog(void) {
     outfile = fopen("log", "wb" );
@@ -53,9 +77,40 @@ static void mtrace_init(void)
 }
 
 
-void mallog(char const * const op, void * ptr, size_t size )
+void log_backtrace() {
+    void* callstack[13];
+    int frames = backtrace(callstack, 13);
+
+    fwrite("#S", 1, 2, outfile);
+    fwrite(&frames, sizeof(int), 1, outfile );
+    fwrite("\n", 1, 1, outfile );
+
+    fflush(outfile);
+    int fd = fileno(outfile);
+    backtrace_symbols_fd(callstack, frames, fd);
+    //for (int i = 3; i < frames; ++i) { // start at 2 (mallog itself is not needed)
+    //    size_t length = strnlen(strs[i], 50);
+    //    fwrite("#s", 1, 2, outfile);
+    //    fwrite(&length, 1, 2, outfile );
+    //    fwrite(strs[i], 1, length, outfile);
+    //    fwrite("\n", 1, 1, outfile );
+    //}
+    //real_free(strs);
+}
+
+void mallog(char const * const op, void * ptr, size_t size, int do_log_backtrace  )
 {
     pid_t tid = gettid();
+
+#   ifdef WITH_FILTER
+    int found = 0;
+    for( size_t i = 0; i < n_filter; ++i )
+      if( filter[i] == tid )
+          ++found;
+    if( found == 0 )
+        return;
+#   endif
+
     if( recursive == tid ) return;
     pthread_mutex_lock(&log_mutex);
     recursive = tid;
@@ -64,11 +119,19 @@ void mallog(char const * const op, void * ptr, size_t size )
     }
 
     time_t t = time(NULL);
+    size_t length = sizeof(pid_t) + sizeof(time_t) + sizeof(void*) + sizeof(size_t) + 1;
+    fwrite(op, 1, 2, outfile);
+    fwrite(&length, sizeof(size_t), 1, outfile);
+    fwrite(&tid,sizeof(pid_t),1,outfile);
     fwrite(&t,sizeof(time_t),1,outfile);
     fwrite(&ptr,sizeof(void*),1,outfile);
     fwrite(&size,sizeof(size_t),1,outfile);
-    fwrite(op, 1, 1, outfile);
     fwrite("\n", 1, 1, outfile);
+
+#   ifdef WITH_STACK
+    if( do_log_backtrace )
+        log_backtrace();
+#   endif
 
     recursive = 0;
     pthread_mutex_unlock(&log_mutex);
@@ -84,7 +147,7 @@ void free(void * ptr)
         return;
 
     real_free(ptr);
-    mallog( "F", ptr, 0);
+    mallog( "#F", ptr, 0, 0);
 }
 void *malloc(size_t size)
 {
@@ -94,7 +157,7 @@ void *malloc(size_t size)
 
     size_t aligned = size; //(size / 128 + 1) * 128;
     void *p = real_malloc(aligned);
-    mallog( "A", p, size);
+    mallog( "#A", p, size, 1);
     return p;
 }
 void *realloc(void * ptr, size_t size)
@@ -105,8 +168,8 @@ void *realloc(void * ptr, size_t size)
 
     size_t aligned = size; //(size / 128 + 1) * 128;
     void *p = real_realloc(ptr, aligned);
-    mallog( "F", ptr, 0);
-    mallog( "A", p, size);
+    mallog( "#F", ptr, 0, 0);
+    mallog( "#A", p, size, 1);
     return p;
 }
 void *calloc(size_t count, size_t size)
@@ -115,6 +178,6 @@ void *calloc(size_t count, size_t size)
         return buffer;
 
     void *p = real_calloc(count,size);
-    mallog( "A", p, count * size);
+    mallog( "#A", p, count * size, 1);
     return p;
 }
