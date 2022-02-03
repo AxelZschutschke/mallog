@@ -1,7 +1,10 @@
 #define _GNU_SOURCE
 
-#define WITH_STACK
-#define WITH_FILTER
+//#define WITH_STACK
+//#define WITH_FILTER
+#define WITH_ALIGN 128
+#define WITH_LOG
+
 
 #include <sys/types.h>
 #include <unistd.h>
@@ -12,13 +15,13 @@
 #include <execinfo.h>
 #include <string.h>
 
-#include "mallog.h"
+//#include "mallog.h"
 
 static void* (*real_malloc)(size_t)=NULL;
 static void* (*real_realloc)(void*, size_t)=NULL;
 static void* (*real_calloc)(size_t, size_t)=NULL;
 static void (*real_free)(void*)=NULL;
-FILE * outfile = NULL;
+static int (*real_pthread)(pthread_t *restrict thread, const pthread_attr_t *restrict attr, void *(*start_routine)(void *), void *restrict arg) = NULL;
 
 char buffer[8192];
 
@@ -26,14 +29,42 @@ pid_t recursive = 0;
 pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t init_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+FILE * outfile = NULL;
 pid_t filter[100];
 size_t n_filter = 0;
 
-void add_filter() {
+void log_backtrace() {
+    void* callstack[20];
+    size_t frames = backtrace(callstack, 20);
+    fwrite("#S", 1, 2, outfile);
+    fwrite(&frames, sizeof(size_t), 1, outfile );
+    fwrite("\n", 1, 1, outfile );
+
+    char ** strs = backtrace_symbols(callstack, frames);
+    for (int i = 2; i < frames; ++i) { // start at 2 (mallog itself is not needed)
+        size_t length = strnlen(strs[i], 100);
+        fwrite("#s", 1, 2, outfile);
+        fwrite(&length, 1, 2, outfile );
+        fwrite(strs[i], 1, length, outfile);
+        fwrite("\n", 1, 1, outfile );
+    }
+    real_free(strs);
+}
+
+void add_filter() 
+{
     if( n_filter >= sizeof(filter) )
         return;
 
     pid_t tid = gettid();
+
+    pthread_mutex_lock(&log_mutex);
+    fwrite("#T", 1, 2, outfile);
+    fwrite(&tid, sizeof(pid_t), 1, outfile);
+    fwrite("\n", 1, 1, outfile);
+    log_backtrace();
+    pthread_mutex_unlock(&log_mutex);
+
     int found = 0;
     for( size_t i = 0; i < n_filter; ++i )
       if( filter[i] == tid )
@@ -43,11 +74,16 @@ void add_filter() {
     n_filter++;
 }
 
-static void open_mallog(void) {
+static void open_mallog(void) 
+{
+    pid_t tid = gettid();
+    fprintf(stderr, "open mallog %d\n", tid);
     outfile = fopen("log", "wb" );
     if (NULL == outfile) {
         fprintf(stderr, "Error opening log file\n");
     }
+    fprintf(stderr, "openened mallog\n");
+    fflush(stderr);
 }
 
 static void mtrace_init(void)
@@ -59,7 +95,6 @@ static void mtrace_init(void)
         real_free = dlsym(RTLD_NEXT, "free");
     if (NULL == real_free) 
         fprintf(stderr, "Error in `dlsym`: %s\n", dlerror());
-
     if (NULL == real_calloc)
         real_calloc= dlsym(RTLD_NEXT, "calloc");
     if (NULL == real_calloc)
@@ -72,35 +107,31 @@ static void mtrace_init(void)
         real_malloc = dlsym(RTLD_NEXT, "malloc");
     if (NULL == real_malloc)
         fprintf(stderr, "Error in `dlsym`: %s\n", dlerror());
-    fprintf(stderr, "Initialized\n" );
+    if (NULL == real_pthread)
+        real_pthread = dlsym(RTLD_NEXT, "pthread_create");
+    if (NULL == real_pthread)
+        fprintf(stderr, "Error in `dlsym`: %s\n", dlerror());
     pthread_mutex_unlock(&init_mutex);
+    fprintf(stderr, "Initialized\n" );
 }
 
 
-void log_backtrace() {
-    void* callstack[13];
-    int frames = backtrace(callstack, 13);
 
-    fwrite("#S", 1, 2, outfile);
-    fwrite(&frames, sizeof(int), 1, outfile );
-    fwrite("\n", 1, 1, outfile );
-
-    fflush(outfile);
-    int fd = fileno(outfile);
-    backtrace_symbols_fd(callstack, frames, fd);
-    //for (int i = 3; i < frames; ++i) { // start at 2 (mallog itself is not needed)
-    //    size_t length = strnlen(strs[i], 50);
-    //    fwrite("#s", 1, 2, outfile);
-    //    fwrite(&length, 1, 2, outfile );
-    //    fwrite(strs[i], 1, length, outfile);
-    //    fwrite("\n", 1, 1, outfile );
-    //}
-    //real_free(strs);
+void log_info(char const * const info, size_t len )
+{
+    pthread_mutex_lock(&log_mutex);
+    len += 1;
+    fwrite("#I", 1, 2, outfile);
+    fwrite(&len, sizeof(size_t), 1, outfile);
+    fwrite(info,1,len-1,outfile);
+    fwrite("\n", 1, 1, outfile);
+    pthread_mutex_unlock(&log_mutex);
 }
 
 void mallog(char const * const op, void * ptr, size_t size, int do_log_backtrace  )
 {
     pid_t tid = gettid();
+    //fprintf(stderr, "mallog %d\n", tid);
 
 #   ifdef WITH_FILTER
     int found = 0;
@@ -114,10 +145,12 @@ void mallog(char const * const op, void * ptr, size_t size, int do_log_backtrace
     if( recursive == tid ) return;
     pthread_mutex_lock(&log_mutex);
     recursive = tid;
+
     if( outfile == NULL ) {
         open_mallog();
     }
 
+#   ifdef WITH_LOG
     time_t t = time(NULL);
     size_t length = sizeof(pid_t) + sizeof(time_t) + sizeof(void*) + sizeof(size_t) + 1;
     fwrite(op, 1, 2, outfile);
@@ -127,6 +160,7 @@ void mallog(char const * const op, void * ptr, size_t size, int do_log_backtrace
     fwrite(&ptr,sizeof(void*),1,outfile);
     fwrite(&size,sizeof(size_t),1,outfile);
     fwrite("\n", 1, 1, outfile);
+#   endif
 
 #   ifdef WITH_STACK
     if( do_log_backtrace )
@@ -139,34 +173,48 @@ void mallog(char const * const op, void * ptr, size_t size, int do_log_backtrace
 
 void free(void * ptr)
 {
+    pid_t tid = gettid();
+    //fprintf(stderr, "free %d\n", tid);
+    if( ptr == buffer )
+        return;
+
     if(real_free==NULL) {
         mtrace_init();
     }
-
-    if( ptr == buffer )
-        return;
 
     real_free(ptr);
     mallog( "#F", ptr, 0, 0);
 }
 void *malloc(size_t size)
 {
+    pid_t tid = gettid();
+    //fprintf(stderr, "malloc %d\n", tid);
     if(real_malloc==NULL) {
         mtrace_init();
     }
 
-    size_t aligned = size; //(size / 128 + 1) * 128;
+#   ifdef  WITH_ALIGN
+    size_t aligned = (size / WITH_ALIGN + 1) * WITH_ALIGN;
+#   else
+    size_t aligned = size;
+#   endif
     void *p = real_malloc(aligned);
     mallog( "#A", p, size, 1);
     return p;
 }
 void *realloc(void * ptr, size_t size)
 {
+    pid_t tid = gettid();
+    //fprintf(stderr, "realloc %d\n", tid);
     if(real_realloc==NULL) {
         mtrace_init();
     }
 
-    size_t aligned = size; //(size / 128 + 1) * 128;
+#   ifdef  WITH_ALIGN
+    size_t aligned = (size / WITH_ALIGN + 1) * WITH_ALIGN;
+#   else
+    size_t aligned = size;
+#   endif
     void *p = real_realloc(ptr, aligned);
     mallog( "#F", ptr, 0, 0);
     mallog( "#A", p, size, 1);
@@ -174,6 +222,8 @@ void *realloc(void * ptr, size_t size)
 }
 void *calloc(size_t count, size_t size)
 {
+    pid_t tid = gettid();
+    //fprintf(stderr, "calloc %d\n", tid);
     if(real_calloc==NULL)
         return buffer;
 
@@ -181,3 +231,35 @@ void *calloc(size_t count, size_t size)
     mallog( "#A", p, count * size, 1);
     return p;
 }
+
+int pthread_create(pthread_t *restrict thread,
+                   const pthread_attr_t *restrict attr,
+                   void *(*start_routine)(void *),
+                   void *restrict arg)
+{
+    pid_t tid = gettid();
+    //fprintf(stderr, "clone %d\n", tid);
+    if(real_pthread==NULL) {
+        mtrace_init();
+    }
+
+    fprintf(stderr, "cloning...\n");
+    int ret = real_pthread(thread, attr, start_routine, arg);
+
+#   ifdef WITH_LOG
+    pthread_mutex_lock(&log_mutex);
+    recursive = tid;
+
+    if( outfile == NULL ) {
+        open_mallog();
+    }
+    fwrite("#T", 1, 2, outfile);
+    fwrite(&ret, sizeof(int), 1, outfile);
+    fwrite("\n", 1, 1, outfile);
+    log_backtrace();
+
+    pthread_mutex_unlock(&log_mutex);
+#   endif
+    return ret;
+}
+
