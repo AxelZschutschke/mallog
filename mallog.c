@@ -1,7 +1,7 @@
 #define _GNU_SOURCE
 
 //#define WITH_FILTER
-#define WITH_ALIGN 128
+//#define WITH_ALIGN 128
 #define WITH_LOG_MALLOC
 #define WITH_LOG_SPAWN
 //#define WITH_LOG_MALLOC_STACK

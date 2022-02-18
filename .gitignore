@@ -1,3 +1,4 @@
 mallog.o
 mallog.so
 libmallog.so
+pagesize

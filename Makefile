@@ -1,6 +1,9 @@
 
 
-all : libmallog.so
+all : libmallog.so pagesize
+
+pagesize: pagesize.c
+	gcc -o pagesize pagesize.c
 
 libmallog.so : mallog.o
 	gcc --shared -fPIC -o libmallog.so mallog.o
