@@ -22,6 +22,7 @@ static void* (*real_malloc)(size_t)=NULL;
 static void* (*real_realloc)(void*, size_t)=NULL;
 static void* (*real_calloc)(size_t, size_t)=NULL;
 static void (*real_free)(void*)=NULL;
+static void (*real_mmap)(void *addr, size_t length, int prot, int flags, int fd, off_t offset) = NULL;
 static int (*real_pthread)(pthread_t *restrict thread, const pthread_attr_t *restrict attr, void *(*start_routine)(void *), void *restrict arg) = NULL;
 
 char buffer[8192];
@@ -42,7 +43,7 @@ void add_filter()
     if( n_filter >= sizeof(filter) )
         return;
 
-    pid_t tid = pthread_self();
+    pthread_t tid = pthread_self();
 
     pthread_mutex_lock(&log_mutex);
     fwrite("#T", 1, 2, outfile);
@@ -124,6 +125,10 @@ static void mtrace_init(void)
         real_pthread = dlsym(RTLD_NEXT, "pthread_create");
     if (NULL == real_pthread)
         fprintf(stderr, "Error in `dlsym`: %s\n", dlerror());
+    if (NULL == real_mmap)
+        real_mmap = dlsym(RTLD_NEXT, "mmap");
+    if (NULL == real_mmap)
+        fprintf(stderr, "Error in `dlsym`: %s\n", dlerror());
     pthread_mutex_unlock(&init_mutex);
     fprintf(stderr, "Initialized\n" );
 }
@@ -196,6 +201,14 @@ void free(void * ptr)
 
     real_free(ptr);
     mallog( "#F", ptr, 0, 0);
+}
+void mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset )
+{
+    if(real_mmap==NULL) {
+        mtrace_init();
+    }
+    fprintf(stderr, "mmap external\n" );
+    return real_mmap(addr, length, prot, flags, fd, offset);
 }
 void *malloc(size_t size)
 {
